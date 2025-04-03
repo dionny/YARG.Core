@@ -12,6 +12,21 @@ namespace YARG.Core.Engine
         where TEngineParams : BaseEngineParameters
         where TEngineStats : BaseStats, new()
     {
+        public Guid ProfileId { get; set; } = Guid.Empty;
+
+        protected bool IsAutoPlayActive()
+        {
+            // Ensure ProfileId is set and ProfileFlagsService is accessible (using Singleton pattern here)
+            // Adjust ProfileFlagsService.Instance call if you use dependency injection or another access method
+            return ProfileId != Guid.Empty && ProfileFlagsService.Instance.IsFlagSet(this.ProfileId, ProfileFlag.AutoPlay);
+        }
+
+        protected bool IsAutoStrumActive()
+        {
+            // Helper for AutoStrum consistency (useful elsewhere)
+            return ProfileId != Guid.Empty && ProfileFlagsService.Instance.IsFlagSet(this.ProfileId, ProfileFlag.AutoStrum);
+        }
+
         // Max number of measures that SP will last when draining
         // SP draining is done based on measures
         protected const double STAR_POWER_MEASURE_AMOUNT = 1.0 / STAR_POWER_MAX_MEASURES;
@@ -437,39 +452,29 @@ namespace YARG.Core.Engine
 
         protected virtual void UpdateSustains()
         {
+            bool isAutoPlay = IsAutoPlayActive();
             EngineStats.PendingScore = 0;
 
             bool isStarPowerSustainActive = false;
-            for (int i = 0; i < ActiveSustains.Count; i++)
+            for (int i = ActiveSustains.Count - 1; i >= 0; i--) // Iterate backwards for safe removal
             {
+                // Use ref ActiveSustains.GetRef(i) if SustainList is optimized struct list
                 ref var sustain = ref ActiveSustains[i];
                 var note = sustain.Note;
 
                 isStarPowerSustainActive |= note.IsStarPower;
 
-                // If we're close enough to the end of the sustain, finish it
-                // Provides leniency for sustains with no gap (and just in general)
                 bool isBurst;
-
-                // Sustain is too short for a burst
-                if (SustainBurstThreshold > note.TickLength)
-                {
-                    isBurst = CurrentTick >= note.Tick;
-                }
-                else
-                {
-                    isBurst = CurrentTick >= note.TickEnd - SustainBurstThreshold;
-                }
+                if (SustainBurstThreshold > note.TickLength) { isBurst = CurrentTick >= note.Tick; }
+                else { isBurst = CurrentTick >= note.TickEnd - SustainBurstThreshold; }
 
                 bool isEndOfSustain = CurrentTick >= note.TickEnd;
-
                 uint sustainTick = isBurst || isEndOfSustain ? note.TickEnd : CurrentTick;
-
                 bool dropped = false;
 
-                if(!CanSustainHold(note))
+                // Check if sustain should be dropped
+                if (!isAutoPlay && !CanSustainHold(note)) // Check !isAutoPlay here
                 {
-                    // Currently beind held by sustain drop leniency
                     if (sustain.IsLeniencyHeld)
                     {
                         if (CurrentTime >= sustain.LeniencyDropTime + EngineParameters.SustainDropLeniency * EngineParameters.SongSpeed)
@@ -484,75 +489,53 @@ namespace YARG.Core.Engine
                         sustain.LeniencyDropTime = CurrentTime;
                     }
                 }
-                else
+                else // Either AutoPlay is ON or CanSustainHold returned true
                 {
                     sustain.IsLeniencyHeld = false;
                 }
 
-                // If the sustain has not finished scoring, then we need to calculate the points
+                // Scoring logic (remains mostly the same)
                 if (!sustain.HasFinishedScoring)
                 {
-                    // Sustain has reached burst threshold, so all points have been given
-                    if (isBurst || isEndOfSustain)
-                    {
-                        sustain.HasFinishedScoring = true;
-                    }
+                    if (isBurst || isEndOfSustain) { sustain.HasFinishedScoring = true; }
 
-                    // Sustain has ended, so commit the points
                     if (dropped || isBurst || isEndOfSustain)
                     {
                         YargLogger.LogFormatTrace("Finished scoring sustain ({0}) at {1} (dropped: {2}, burst: {3})",
                             sustain.Note.Tick, CurrentTime, dropped, isBurst);
-
                         double finalScore = CalculateSustainPoints(ref sustain, sustainTick);
-                        var points = (int) Math.Ceiling(finalScore);
+                        var points = (int)Math.Ceiling(finalScore);
+                        AddScore(points); // AddScore handles multiplier/SP internally
 
-                        AddScore(points);
-
-                        // SustainPoints must include the multiplier, but NOT the star power multiplier
-                        int sustainPoints = points * EngineStats.ScoreMultiplier;
-                        if (EngineStats.IsStarPowerActive)
-                        {
-                            sustainPoints /= 2;
-                        }
-
+                        int sustainPoints = points * (BaseStats.IsStarPowerActive ? BaseStats.ScoreMultiplier / 2 : BaseStats.ScoreMultiplier);
                         EngineStats.SustainScore += sustainPoints;
                     }
                     else
                     {
                         double score = CalculateSustainPoints(ref sustain, sustainTick);
-
-                        var sustainPoints = (int) Math.Ceiling(score);
-
-                        // It's ok to use multiplier here because PendingScore is only temporary to show the correct
-                        // score on the UI.
-                        EngineStats.PendingScore += sustainPoints * EngineStats.ScoreMultiplier;
+                        var sustainPoints = (int)Math.Ceiling(score);
+                        EngineStats.PendingScore += sustainPoints * BaseStats.ScoreMultiplier;
                     }
                 }
 
-                // Only remove the sustain if its dropped or has reached the final tick
+                // Remove sustain if dropped or ended
                 if (dropped || isEndOfSustain)
                 {
                     EndSustain(i, dropped, isEndOfSustain);
-                    i--;
+                    // No need for i-- because we iterate backwards
                 }
             }
 
-            UpdateStars();
+            UpdateStars(); // Ensure stars reflect sustain score updates
 
+            // SP Whammy logic (remains the same)
             if (isStarPowerSustainActive && StarPowerWhammyTimer.IsActive)
             {
                 var whammyTicks = CurrentTick - LastStarPowerWhammyTick;
-
                 GainStarPower(whammyTicks);
                 EngineStats.StarPowerWhammyTicks += whammyTicks;
-
                 LastStarPowerWhammyTick = CurrentTick;
             }
-
-            // Whammy is disabled after sustains are updated.
-            // This is because all the ticks that have accumulated will have been accounted for when it is disabled.
-            // Whereas disabling it before could mean there are some ticks which should have been whammied but weren't.
             if (StarPowerWhammyTimer.IsActive && StarPowerWhammyTimer.IsExpired(CurrentTime))
             {
                 StarPowerWhammyTimer.Disable();

@@ -112,6 +112,13 @@ namespace YARG.Core.Engine.Guitar
 
         protected virtual void Overstrum()
         {
+             // ADD AUTOPLAY CHECK HERE
+            if (IsAutoPlayActive() || IsAutoStrumActive()) // Need access to this method, assumes it's moved to BaseEngine
+            {
+                YargLogger.LogFormatTrace("Overstrum prevented during AutoPlay at time: {0}", CurrentTime);
+                return;
+            }
+
             // Can't overstrum before first note is hit/missed
             if (NoteIndex == 0)
             {
@@ -165,6 +172,11 @@ namespace YARG.Core.Engine.Guitar
 
         protected override bool CanSustainHold(GuitarNote note)
         {
+            if (IsAutoPlayActive())
+            {
+                return true; // Autoplay always holds sustains correctly
+            }
+
             var mask = note.IsDisjoint ? note.DisjointMask : note.NoteMask;
 
             var buttonsMasked = ButtonMask;
